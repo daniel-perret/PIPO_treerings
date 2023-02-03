@@ -1,0 +1,1319 @@
+---
+title: "pipo_ms_code_complete"
+author: "D Perret"
+date: "02/03/2023"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This document compiles code used for analyses in the manuscript titled "A species' response to spatial climatic variation does not predict its response to climate change". It should be accompanied by several RData files containing tree ring data, climate data, and fitted models, which will allow analyses to be repeated without performing time-consuming data processing and model fitting.
+
+```{r}
+library(dplyr)
+library(brms)
+library(tidybayes)
+library(brmstools)
+library(bayesplot)
+library(glmmTMB)
+library(ggplot2)
+library(rgdal)
+library(adehabitatHR)
+library(rgeos)
+library(sp)
+library(DHARMa)
+library(openair)
+
+#code to make gg theme look like baseR
+theme_set(theme_bw())
+theme_update(text = element_text(size=16),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             strip.background = element_blank(),
+             panel.border=element_rect(size=1.5))
+
+#brms DHARMa function
+
+check_brms <- function(model,             # brms model
+                       integer = FALSE,   # integer response? (TRUE/FALSE)
+                       plot = TRUE,       # make plot?
+                       ...                # further arguments for DHARMa::plotResiduals 
+) {
+  
+  mdata <- brms::standata(model)
+  if (!"Y" %in% names(mdata))
+    stop("Cannot extract the required information from this brms model")
+  
+  dharma.obj <- DHARMa::createDHARMa(
+    simulatedResponse = t(brms::posterior_predict(model, nsamples = 1000)),
+    observedResponse = mdata$Y, 
+    fittedPredictedResponse = apply(
+      t(brms::posterior_epred(model, nsamples = 1000, re.form = NA)),
+      1,
+      mean),
+    integerResponse = integer)
+  
+  if (isTRUE(plot)) {
+    plot(dharma.obj, ...)
+  }
+  
+  invisible(dharma.obj)
+  
+}
+
+```
+
+First, we load data objects:
+
+```{r}
+# this contains five dataframes, "annual.summaries", "core.summaries", "site.summaries", "tree.summaries", and "tree.summaries.a" --- these are various tree ring data summaries, associated with climate data and all necessary site metadata
+load("tree_summaries_newclim111021.Rdata")
+
+# and just a bit of additional data filtering, removing some problematic records, and adding a few additional variables
+tree.summaries <- tree.summaries.a %>% 
+  filter(!(Site=="b2r1" & Year<1950),
+         !(Site=="hood" & Tree%in%c(2,8,9)),
+         !(Site=="a4r3" & Tree==13),
+         !(Site=="verd" & Year<1935),
+         !(Year==1895),
+         !(Site=="dead" & Tree == 6)) %>% 
+  ungroup() %>% 
+  mutate(BAI2 = BAI + 1) %>% 
+  # dplyr::select(-s.indiv.TS,
+  #               -s.indiv.BA) %>% 
+  group_by(Site,Tree) %>% 
+  mutate(s.indiv.TS = scale(Tree.Size),
+         s.indiv.BA = scale(Basal.Area)) %>% 
+  group_by(Site) %>% 
+  mutate(s.site.TS = scale(Tree.Size),
+         s.site.BA = scale(Tree.Size)) %>% 
+  ungroup()
+
+# this contains future climate projections (climna.ssp126, climna.ssp245, climna.ssp370, climna.ssp585)
+load("climna_future.Rdata")
+
+# this contains the final fitted model ("b.3") -- code for the model itself and validation is contained in this document as well.
+load("bayes_model3_2.Rdata")
+
+```
+
+Next, we split our tree-ring data into training (pre-data) and validation (post-data) sets. These correspond with the "model fitting period" and the "near-past warming" periods referenced in the manuscript.
+
+```{r}
+## PRE- DATA
+pre.dat <- tree.summaries %>% 
+  dplyr::select(Site, Tree, Year, contains("BA"), contains("TS"), BAI, RW, Tree.Size, Basal.Area) %>% 
+  filter(Year < 1980) %>% 
+  ## ADDING SEASONAL VARIABLES, **LOCALLY SCALED**
+  left_join(.,
+            annual.summaries %>% 
+              dplyr::select(Site,Year,contains(c("_tmax","_ppt","_tmean")),bio01,bio12,bio05,bio06) %>% 
+              group_by(Site) %>% 
+              mutate(across(contains(c("_tmax","_ppt","_tmean","bio")), scale)) %>% 
+              filter(Year < 1980),
+            by = c("Site","Year")) %>% 
+  ## ADDING CLIMATE NORMALS, **GLOBALLY SCALED**
+  left_join(.,
+            annual.summaries %>% 
+              mutate(across(contains("bio"),scale)) %>% 
+              filter(Year < 1980) %>% 
+              group_by(Site) %>% 
+              summarise(across(contains("bio"), mean)) %>% 
+              dplyr::select(Site, contains("bio")) %>% 
+              rename_with(~paste0(.x,".allnorm"), contains("bio")),
+            by = "Site") %>% 
+  ## ADDING ROLLING MAT/AP MEANS, **GLOBALLY SCALED**
+  left_join(.,
+            annual.summaries %>%
+              mutate(s.bio01_30yr.end = scale(bio01_30yr.end, center=mean(bio01), scale=sd(bio01)),
+                     s.bio12_30yr.end = scale(bio12_30yr.end, center=mean(bio12), scale=sd(bio12))) %>% 
+              filter(Year < 1980) %>%
+              dplyr::select(Site, Year, s.bio01_30yr.end, bio01_30yr.end, s.bio12_30yr.end, bio01_30yr.end),
+            by=c("Site","Year")) %>% 
+  mutate(s.BAI=BAI/max(BAI))
+
+
+## POST- DATA
+post.dat <- tree.summaries %>% 
+  dplyr::select(Site, Tree, Year, contains("BA"), contains("TS"), BAI, RW, Tree.Size, Basal.Area) %>% 
+  filter(Year > 1979) %>% 
+  ## ADDING SEASONAL VARIABLES, **LOCALLY SCALED**
+  left_join(.,
+            annual.summaries %>% 
+              dplyr::select(Site,Year,contains(c("_tmax","_ppt","_tmean")),bio01,bio12,bio05,bio06) %>% 
+              group_by(Site) %>% 
+              mutate(across(contains(c("_tmax","_ppt","_tmean","bio")), scale)) %>% 
+              filter(Year > 1979),
+            by = c("Site","Year")) %>% 
+  ## ADDING CLIMATE NORMALS, **GLOBALLY SCALED**
+  left_join(.,
+            annual.summaries %>% 
+              mutate(across(contains("bio"),scale)) %>% 
+              filter(Year > 1979) %>% 
+              group_by(Site) %>% 
+              summarise(across(contains("bio"), mean)) %>% 
+              dplyr::select(Site, contains("bio")) %>% 
+              rename_with(~paste0(.x,".allnorm"), contains("bio")),
+            by = "Site") %>% 
+  ## ADDING ROLLING MAT/AP MEANS, **GLOBALLY SCALED**
+  left_join(.,
+            annual.summaries %>%
+              mutate(s.bio01_30yr.end = scale(bio01_30yr.end, center=mean(bio01), scale=sd(bio01)),
+                     s.bio12_30yr.end = scale(bio12_30yr.end, center=mean(bio12), scale=sd(bio12))) %>% 
+              filter(Year > 1979) %>%
+              dplyr::select(Site, Year, s.bio01_30yr.end, bio01_30yr.end, s.bio12_30yr.end, bio01_30yr.end),
+            by=c("Site","Year")) %>% 
+  left_join(.,
+            pre.dat %>% 
+              group_by(Site,Tree) %>% 
+              summarise(mean.preBA = mean(s.site.BA),
+                        mean.preBAI = mean(BAI)),
+            by=c("Site","Tree"))
+
+```
+
+Now we can build our hierarchical model. Running this code takes a long time -- the fitted model is already saved in an RData file ("bayes_model3_2.Rdata"), and loaded in the global environment as `b.3`
+
+```{r}
+
+b.3 <- brms::brm(data = pre.dat,
+                 formula = BAI ~ s.site.BA +
+                   bio01.allnorm*bio12.allnorm +
+                   
+                   p.jj_tmax + p.as_tmax + p.on_tmax + djf_tmax +
+                   ma_tmax + mj_tmax + ja_tmax + so_tmax + nd_tmax +
+                   p.jj_ppt + p.as_ppt + p.on_ppt + djf_ppt +
+                   ma_ppt + mj_ppt + ja_ppt + so_ppt + nd_ppt +
+                   
+                   (s.site.BA+
+                      p.jj_tmax + p.as_tmax + p.on_tmax + djf_tmax +
+                      ma_tmax + mj_tmax + ja_tmax + so_tmax + nd_tmax +
+                      p.jj_ppt + p.as_ppt + p.on_ppt + djf_ppt +
+                      ma_ppt + mj_ppt + ja_ppt + so_ppt + nd_ppt
+                    | Site) + 
+                   
+                   (1|Site:Tree),
+                 family = Gamma(link="log"),
+                 iter = 2000,
+                 chains = 3,
+                 cores = getOption("mc.cores",3));save(b.3,file="bayes_model3.Rdata")
+
+```
+
+Next we perform some basic model diagnostics, starting with inspecting the coefficient posterior distributions and model chains:
+```{r}
+plot(b.3)
+```
+
+Then inspect credible intervals and r-hat statistics:
+```{r}
+print(b.3)
+```
+
+Next, we do some posterior predictive checks, to see how well our model captures the data:
+```{r}
+#drawing from the posterior distribution
+yrep <- posterior_predict(b.3, ndraws=500)
+
+#overall fit
+ppc_dens_overlay(y = b.3$data$BAI,
+                 yrep = yrep,
+                 size=2,
+                 alpha = 0.5) +
+  xlim(0,10000)
+
+#site-specific fit
+ppc_violin_grouped(y = b.3$data$BAI,
+                   yrep = yrep,
+                   group = b.3$data$Site)
+```
+
+Another way to inspect fit and validate the model is to plot observed site BAI chronologies against posterior predictions. The following code generates Figure S5:
+
+```{r}
+# As timeseries:
+pre.dat %>% filter(!is.na(p.jjas_ppt)) %>% 
+  bind_cols(as.data.frame(fitted(b.3))) %>% 
+  group_by(Site,Year) %>% 
+  summarise(mean.BAI = mean(BAI),
+            sd.BAI = sd(BAI),
+            mean.fit = mean(Estimate),
+            mean.upper = mean(Q97.5),
+            mean.lower = mean(Q2.5)) %>% 
+  ggplot(.,aes(x = Year)) +
+  # geom_ribbon(aes(ymin = mean.BAI-sd.BAI,
+  #                 ymax = mean.BAI+sd.BAI),
+  #             col=NA, fill="black", alpha=0.3)+
+  geom_line(aes(y=mean.BAI),
+            col="black")+
+  geom_ribbon(aes(ymin = mean.lower,
+                  ymax = mean.upper),
+              col=NA, fill="red", alpha=0.4)+
+  geom_line(aes(y=mean.fit),
+            col="red") +
+  facet_wrap(~factor(Site, levels = c("a5r2","a4r3","b5r3","b5r1","a5r1","a5r3","a4r2","b5r2","crla","mill","hood","a3r1","verd","b2r1","svil","a4r4","b4r1","ash","b1r1","mad","griz","b1r3","dead")), 
+             scales = "free_y",
+             ncol=3)
+
+# As scatterplots:
+
+pre.dat %>% filter(!is.na(p.jjas_ppt)) %>% 
+  bind_cols(as.data.frame(fitted(b.3))) %>% 
+  group_by(Site,Year) %>%
+  summarise(mean.BAI = mean(BAI),
+            sd.BAI = sd(BAI),
+            mean.fit = mean(Estimate),
+            mean.upper = mean(Q97.5),
+            mean.lower = mean(Q2.5)) %>%
+  ggplot(.,aes(x = mean.BAI, y = mean.fit)) +
+  geom_abline(slope=1,intercept=0,col="red") +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope=1,intercept=0,col="red") +
+  geom_smooth(method = "lm") +
+  facet_wrap(~factor(Site, levels = c("a5r2","a4r3","b5r3","b5r1","a5r1","a5r3","a4r2","b5r2","crla","mill","hood","a3r1","verd","b2r1","svil","a4r4","b4r1","ash","b1r1","mad","griz","b1r3","dead")), 
+             scales = "free")
+```
+
+This demonstrates that model fit does vary substantially between sites. This is expected, as the strength of climate-growth relationships varies at the scale of both trees and sites. We can quantify this site-specific fit using fitted-observed correlations, comparing the variance of both, and calculating the root mean squared error within each site. This is all visualized using a Taylor diagram, as in Figure S4:
+
+```{r}
+
+openair::TaylorDiagram(mydata = pre.dat %>% 
+                         filter(!is.na(p.jjas_ppt)) %>% 
+                         bind_cols(as.data.frame(fitted(b.3))),
+                       obs = "BAI",
+                       mod="Estimate",
+                       #type="Site",
+                       group = "Site",
+                       normalise = T,
+                       auto.text = F)
+
+```
+
+
+Analyses:
+
+1) First, we'll apply the model to make species-wide and population-level growth predictions for each site during the near-past period of observed climate warming (1982-2015).
+
+Here are the species-wide predictions, made by substituting observed 30-year rolling average temperatures into the spatially-varying climate normal terms in the model, and setting temporally-varying climate variables to their model training period mean.
+```{r}
+species.pred <- fitted(b.3,
+                       newdata = post.dat %>%
+                         dplyr::select(-contains(c("tmax","ppt")),
+                                       -bio01.allnorm,-bio12.allnorm) %>%
+                         mutate(bio01.allnorm = s.bio01_30yr.end,
+                                bio12.allnorm = s.bio12_30yr.end,
+                                s.site.BA = s.site.BA) %>% 
+                         left_join(pre.dat %>% 
+                                     dplyr::select(Site,contains(c("tmax","ppt"))) %>% 
+                                     group_by(Site) %>% 
+                                     summarise(across(where(is.numeric),
+                                                      mean,na.rm=T)),
+                                   by="Site"),
+                       re_formula = ~(1 + s.site.BA |Site) + (1|Site:Tree),
+                       scale = "response",
+                       resp = c("bio01.allnorm","bio12.allnorm","s.site.BA"), # play with this!
+) %>% 
+  as.data.frame() %>% 
+  bind_cols(post.dat) %>% 
+  left_join(., pre.dat %>%
+              group_by(Site,Tree) %>%
+              summarise(premean.BAI = mean(BAI),
+                        s.site.BA = mean(s.site.BA)),
+            by=c("Site","Tree")) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+```
+
+And here are the population-level predictions, made by setting the spatially-varying cliamte normal terms to the model-training period mean, and using observed annual climate during the predictions period.
+
+```{r}
+pop.pred <- fitted(b.3,
+                   newdata = post.dat %>% 
+                     dplyr::select(-bio01.allnorm,-bio12.allnorm) %>% 
+                     left_join(pre.dat %>% 
+                                 dplyr::select(Site,bio01.allnorm,bio12.allnorm) %>% 
+                                 distinct(),
+                               by="Site") %>% 
+                     mutate(s.site.BA = mean.preBA),
+                   re_formula = NULL,
+                   #resp = c("p.jjas_tmax","djf_tmax","mam_tmax","jjas_tmax","p.jjas_ppt","djf_ppt","mam_ppt","jjas_ppt"),
+                   scale="response"
+) %>% 
+  as.data.frame() %>% 
+  bind_cols(post.dat) %>% 
+  left_join(., pre.dat %>%
+              group_by(Site,Tree) %>%
+              summarise(premean.BAI = mean(BAI),
+                        premean.BA = mean(s.site.BA)),
+            by=c("Site","Tree")) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+```
+
+We can plot these predictions, along with observed growth, as time-series -- as in Figure S2:
+
+```{r}
+species.pred %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),median,na.rm=T)) %>%
+  ggplot(.,aes(x=Year))+#,group=Site))+
+  geom_ribbon(aes(ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="blue",
+              col=NA,
+              alpha=0.2) +
+  geom_line(aes(y=prop.Estimate),
+            col="darkblue", lwd=0.5)+
+  
+  geom_ribbon(data = pop.pred %>% 
+                group_by(Site,Year) %>% 
+                summarise(across(where(is.numeric),median,na.rm=T)),
+              aes(ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="red",
+              col=NA,
+              alpha=0.2) +
+  geom_line(data = pop.pred %>% 
+              group_by(Site,Year) %>% 
+              summarise(across(where(is.numeric),median,na.rm=T)),
+            aes(y=prop.Estimate),
+            col="darkred",lwd=0.5)+
+  
+  geom_line(data = post.dat %>% 
+              mutate(rel.BAI = BAI/mean.preBAI) %>% 
+              group_by(Site,Year) %>% 
+              summarise(across(where(is.numeric),median,na.rm=T)),
+            aes(y=rel.BAI),
+            col="black",
+            lwd=0.5)+
+  
+  geom_vline(xintercept = 1980,
+             lwd=2, col="gray") +
+  
+  geom_violin(data = pre.dat %>% 
+                group_by(Site,Tree) %>% 
+                mutate(rel.BAI = BAI/mean(BAI)) %>% 
+                group_by(Site,Year) %>% 
+                summarise(across(where(is.numeric),median)),  
+              inherit.aes = F,
+              aes(x = 1975,         #change this to fit the timescale of the data
+                  y = rel.BAI),
+              width=4,
+              fill="gray", lwd=0.5 ,
+              trim=T,
+              draw_quantiles = c(0.5,0.125,0.875)) +
+  geom_hline(yintercept=1,col="black",lwd=1,lty=1) +
+  labs( x = "Year",
+        y = "Relative growth")+
+  facet_wrap(~factor(Site, levels = c("a5r2","a4r3","b5r3","b5r1","a5r1","a5r3","a4r2","b5r2","crla","mill","hood","a3r1","verd","b2r1","svil","a4r4","b4r1","ash","b1r1","mad","griz","b1r3","dead")), 
+             scales = "free_y",
+             ncol=3)
+```
+
+If we aggregate across all sites by using median predicted and observed values in each year, we get main text Figure 2B:
+
+```{r}
+
+species.pred %>% 
+  group_by(Year) %>% 
+  summarise(across(where(is.numeric),median,na.rm=T)) %>%
+  ggplot(.,aes(x=Year))+#,group=Site))+
+  geom_ribbon(aes(ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="blue",
+              col=NA,
+              alpha=0.2) +
+  geom_line(aes(y=prop.Estimate),
+            col="darkblue", lwd=1)+
+  
+  geom_ribbon(data = pop.pred %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),median,na.rm=T)),
+              aes(ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="red",
+              col=NA,
+              alpha=0.2) +
+  geom_line(data = pop.pred %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),median,na.rm=T)),
+            aes(y=prop.Estimate),
+            col="red3",lwd=1)+
+  
+  geom_line(data = post.dat %>% 
+              mutate(rel.BAI = BAI/mean.preBAI) %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),median,na.rm=T)),
+            aes(y=rel.BAI),
+            col="black",
+            lwd=1)+
+  
+  geom_vline(xintercept = 1980,
+             lwd=2, col="gray") +
+  
+  geom_violin(data = pre.dat %>% 
+                group_by(Site,Tree) %>% 
+                mutate(rel.BAI = BAI/mean(BAI)) %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean)),  
+              inherit.aes = F,
+              aes(x = 1975,         #change this to fit the timescale of the data
+                  y = rel.BAI),
+              width=4,
+              fill="gray", lwd=0.5,
+              trim=T,
+              draw_quantiles = c(0.5,0.125,0.875)) +
+  geom_hline(yintercept=1,col="black",lwd=1,lty=1) +
+  labs( x = "Year",
+        y = "Relative growth")
+
+```
+
+To quantify how well each prediction type reflected observed growth trends in the near-past, we calculated Pearson's correlation coefficients between observed and predicted growth for each site and prediction type. For species-wide predictions, these correlations were calculated between predicted growth and 30-year rolling mean observed growth -- this is because species-wide predictions were made using similarly averaged climate normals.
+
+```{r}
+
+species.cor <- species.pred %>% 
+  filter(Year %in% period) %>% 
+  left_join(tree.summaries %>% 
+              group_by(Site,Tree) %>% 
+              mutate(r.BAI = zoo::rollmean(BAI,k=30,align="right",na.pad=T)) %>% 
+              dplyr::select(Site,Tree,Year,r.BAI),
+            by=c("Site","Tree","Year")) %>% 
+  group_by(Site,Tree) %>% 
+  summarise(Est.cor = cor(Estimate,r.BAI)) %>%
+  group_by(Site) %>% 
+  summarise(across(where(is.numeric),mean,na.rm=T)) %>% 
+  left_join(.,dist,by="Site")
+
+pop.cor <- pop.pred %>% 
+  left_join(tree.summaries %>% 
+              group_by(Site,Tree) %>% 
+              mutate(r.BAI = zoo::rollmean(BAI,k=30,align="right",na.pad=T)) %>% 
+              dplyr::select(Site,Tree,Year,r.BAI),
+            by=c("Site","Tree","Year")) %>% 
+  filter(Year %in% period) %>% 
+  group_by(Site,Tree) %>% 
+  summarise(Est.cor = cor(Estimate,BAI)) %>%
+  group_by(Site) %>% 
+  summarise(across(where(is.numeric),mean,na.rm=T)) %>% 
+  left_join(.,dist,by="Site")
+
+```
+
+If we plot these correlations against mean near-past temperature anomalies observed at each site, we get main text Figure 2C:
+
+```{r}
+
+period <- 1980:2015
+
+# temp anomalies
+bio01.scaling <- annual.summaries %>% 
+  filter(Year<1980) %>% 
+  group_by(Site) %>% 
+  summarise(mean.bio01 = mean(bio01),
+            sd.bio01 = sd(bio01),
+            mean.bio12 = mean(bio12),
+            sd.bio12 = sd(bio12))
+
+dist <- annual.summaries %>%
+  left_join(., bio01.scaling,
+            by="Site") %>% 
+  mutate(bio01.anom = bio01-mean.bio01,
+         bio12.anom = bio12-mean.bio12,
+         bio12.anom.prop = bio12.anom/mean.bio12) %>% 
+  filter(Year %in% period) %>% 
+  group_by(Site) %>% 
+  summarize(mean.bio01.anom = mean(bio01.anom),
+            sum.bio01.anom = sum(bio01.anom),
+            mean.bio12.anom = mean(bio12.anom),
+            sum.bio12.anom = sum(bio12.anom),
+            mean.bio12.anom.prop = mean(bio12.anom.prop)) %>% 
+  ungroup()
+
+# plot
+species.cor %>%  
+  ggplot(., aes(x = mean.bio01.anom,
+                y = Est.cor)) +
+  geom_point(pch = 19, alpha = 0.4,
+             col = "blue",
+             size = 2.5) +
+  geom_smooth(method = "lm",
+              col = 'darkblue',
+              fill = "gray") +
+  geom_point(pch = 19, alpha = 0.4,
+             col = "red",
+             data = pop.cor,
+             size=2.5) +
+  geom_smooth(method = "lm",
+              col = 'darkred',
+              fill = "gray",
+              data = pop.cor) +
+  labs(x = "Mean 1980-2015 MAT anomaly (from pre-1980 MAT)",
+       y = "r") +
+  geom_hline(yintercept = 0,lty=2)
+```
+
+The next application of the model will be to make future growth projections using species-wide and population-level responses separately.
+
+Future climate data were already loaded from the "climna_future.Rdata" file. Climate data came from ClimateNA -- see main text and supplementary methods for details. First, these data need to be formatted identically to the data used to train the model. We'll do this first for climate scenario **SSP5-8.5**:
+
+```{r}
+
+future.annual.summaries <- 
+  climna.ssp585 %>% 
+  # climna.ssp370 %>% 
+  # climna.ssp245 %>% 
+  # climna.ssp126 %>% 
+  filter(Site %in% annual.summaries$Site)
+
+future.dat <- future.annual.summaries %>% 
+  bind_rows(.,annual.summaries %>% 
+              dplyr::select(which(names(.)%in%names(future.annual.summaries)))) %>% 
+  arrange(Site,Year) %>% 
+  group_by(Site) %>% 
+  mutate(r.bio01 = zoo::rollmean(bio01,k=30,align="right",fill="extend"), 
+         r.bio12 = zoo::rollmean(bio12,k=30,align="right",fill="extend")) %>% 
+  filter(Year>2015) %>%
+  left_join(., post.dat %>% 
+              dplyr::select(Site,Tree) %>% 
+              distinct(),
+            by="Site") %>%
+  left_join(., annual.summaries %>% 
+              dplyr::select(Site,Year,contains(c("_tmax","_ppt","_tmean"))) %>% 
+              group_by(Site) %>% 
+              summarise(across(contains(c("_tmax","_ppt","_tmean")), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T)),
+            by="Site") %>% 
+  bind_cols(., annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(across(contains("bio"), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = bio01,
+         bio12.allnorm = bio12,
+         bio01 = (bio01-bio01_mean)/bio01_sd,
+         bio12 = (bio12-bio12_mean)/bio12_sd,
+         p.jj_tmax = (p.jj_tmax-p.jj_tmax_mean)/p.jj_tmax_sd,
+         p.as_tmax = (p.as_tmax-p.as_tmax_mean)/p.as_tmax_sd,
+         p.on_tmax = (p.on_tmax-p.on_tmax_mean)/p.on_tmax_sd,
+         djf_tmax = (djf_tmax-djf_tmax_mean)/djf_tmax_sd,
+         ma_tmax = (ma_tmax-ma_tmax_mean)/ma_tmax_sd,
+         mj_tmax = (mj_tmax-mj_tmax_mean)/mj_tmax_sd,
+         ja_tmax = (ja_tmax-ja_tmax_mean)/ja_tmax_sd,
+         so_tmax = (so_tmax-so_tmax_mean)/so_tmax_sd,
+         nd_tmax = (nd_tmax-nd_tmax_mean)/nd_tmax_sd,
+         p.jj_ppt = (p.jj_ppt-p.jj_ppt_mean)/p.jj_ppt_sd,
+         p.as_ppt = (p.as_ppt-p.as_ppt_mean)/p.as_ppt_sd,
+         p.on_ppt = (p.on_ppt-p.on_ppt_mean)/p.on_ppt_sd,
+         djf_ppt = (djf_ppt-djf_ppt_mean)/djf_ppt_sd,
+         ma_ppt = (ma_ppt-ma_ppt_mean)/ma_ppt_sd,
+         mj_ppt = (mj_ppt-mj_ppt_mean)/mj_ppt_sd,
+         ja_ppt = (ja_ppt-ja_ppt_mean)/ja_ppt_sd,
+         so_ppt = (so_ppt-so_ppt_mean)/so_ppt_sd,
+         nd_ppt = (nd_ppt-nd_ppt_mean)/nd_ppt_sd,
+         s.r.bio01 = (r.bio01-bio01_mean)/bio01_sd,
+         s.r.bio12 = (r.bio12-bio12_mean)/bio12_sd) %>%
+  dplyr::select(-contains(c("_mean","_sd"))) %>% 
+  bind_cols(.,annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(bio01_mean = mean(bio01),
+                        bio12_mean = mean(bio12),
+                        bio01_sd = sd(bio01),
+                        bio12_sd = sd(bio12))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = mean((bio01.allnorm-bio01_mean)/bio01_sd),
+         bio12.allnorm = mean((bio12.allnorm-bio12_mean)/bio12_sd)) %>% 
+  dplyr::select(-contains(c("_mean","_sd","ppt_","tmax_","tmin","tmean"))) %>% 
+  left_join(., pre.dat %>%
+              group_by(Site,Tree) %>%
+              summarise(premean.BAI = mean(BAI),
+                        s.site.BA = mean(s.site.BA)),
+            by=c("Site","Tree"))
+
+```
+
+Then, we can make predictions using species-wide and population-level responses separately by setting the unused variables to the training-period means:
+
+```{r}
+
+species.fut <- fitted(b.3,
+                      newdata = future.dat %>% 
+                        dplyr::select(-contains(c("tmax","ppt"))) %>% 
+                        left_join(pre.dat %>% 
+                                    dplyr::select(Site,contains(c("tmax","ppt"))) %>% 
+                                    group_by(Site) %>% 
+                                    summarise(across(where(is.numeric),mean,na.rm=T)),
+                                  by="Site") %>% 
+                        mutate(bio01.allnorm = s.r.bio01,
+                               bio12.allnorm = s.r.bio12),
+                      re_formula = ~(1 + s.site.BA |Site) + (1|Site:Tree),
+                      scale = "response",
+                      resp = c("bio01.allnorm","bio12.allnorm","s.site.BA"), # play with this!
+) %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+pop.fut <- fitted(b.3,
+                  newdata = future.dat %>% 
+                    dplyr::select(-bio01.allnorm,-bio12.allnorm) %>% 
+                    left_join(pre.dat %>% 
+                                dplyr::select(Site,bio01.allnorm,bio12.allnorm) %>% 
+                                distinct(),
+                              by="Site"),
+                  re_formula = NULL,
+                  resp = c("p.jj_tmax","p.as_tmax","p.on_tmax","djf_tmax","ma_tmax","mj_tmax","ja_tmax","so_tmax","p.jj_ppt","p.as_ppt","p.on_ppt","djf_ppt","ma_ppt","mj_ppt","ja_ppt","so_ppt"),
+                  scale="response") %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+```
+
+If we plot these predictions as time-series, we recreate Figure 2D:
+
+```{r}
+
+species.fut %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean,na.rm=T)) %>%
+  ggplot(.,aes(x=Year,group=Site))+
+  geom_line(aes(y=prop.Estimate),
+            col="darkblue", lwd=0.5,
+            alpha=0.25)+
+  geom_line(data = pop.fut %>%
+              group_by(Site,Year) %>%
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            aes(y=prop.Estimate),
+            col="darkred",lwd=0.5,
+            alpha=0.25)+
+  
+  #mean species
+  geom_ribbon(data = species.fut %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="dodgerblue3",
+              col=NA,
+              alpha=0.55) +
+  geom_line(data = species.fut %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkblue",lwd=1.25) +
+  
+  #mean population
+  geom_ribbon(data = pop.fut %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="red",
+              col=NA,
+              alpha=0.60) +
+  geom_line(data = pop.fut %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkred",lwd=1.25) +
+  geom_vline(xintercept = 2016,
+             lwd=2, col="gray") +
+  geom_violin(data = tree.summaries %>% 
+                filter(Year<1980) %>% 
+                group_by(Site,Tree) %>% 
+                mutate(rel.BAI = BAI/mean(BAI)) %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean)),         
+              inherit.aes=F,
+              aes(x = 2010,         #change this to fit the timescale of the data
+                  y = rel.BAI),
+              width=4,
+              fill="gray", lwd=0.5 ,
+              trim=T,
+              draw_quantiles = c(0.5,0.125,0.875)) +
+  geom_hline(yintercept=1,col="black",lwd=1,lty=2) +
+  labs( x = "Year",
+        y = "Relative growth",
+        title = "SSP5-8.5")
+
+
+```
+
+We can do the same for different climate scenarios:
+
+**SSP2-4.5**:
+
+```{r}
+
+future.annual.summaries <- 
+  # climna.ssp585 %>% 
+  # climna.ssp370 %>% 
+  climna.ssp245 %>% 
+  # climna.ssp126 %>% 
+  filter(Site %in% annual.summaries$Site)
+
+future.dat <- future.annual.summaries %>% 
+  bind_rows(.,annual.summaries %>% 
+              dplyr::select(which(names(.)%in%names(future.annual.summaries)))) %>% 
+  arrange(Site,Year) %>% 
+  group_by(Site) %>% 
+  mutate(r.bio01 = zoo::rollmean(bio01,k=30,align="right",fill="extend"), 
+         r.bio12 = zoo::rollmean(bio12,k=30,align="right",fill="extend")) %>% 
+  filter(Year>2015) %>%
+  left_join(., post.dat %>% 
+              dplyr::select(Site,Tree) %>% 
+              distinct(),
+            by="Site") %>%
+  left_join(., annual.summaries %>% 
+              dplyr::select(Site,Year,contains(c("_tmax","_ppt","_tmean"))) %>% 
+              group_by(Site) %>% 
+              summarise(across(contains(c("_tmax","_ppt","_tmean")), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T)),
+            by="Site") %>% 
+  bind_cols(., annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(across(contains("bio"), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = bio01,
+         bio12.allnorm = bio12,
+         bio01 = (bio01-bio01_mean)/bio01_sd,
+         bio12 = (bio12-bio12_mean)/bio12_sd,
+         p.jj_tmax = (p.jj_tmax-p.jj_tmax_mean)/p.jj_tmax_sd,
+         p.as_tmax = (p.as_tmax-p.as_tmax_mean)/p.as_tmax_sd,
+         p.on_tmax = (p.on_tmax-p.on_tmax_mean)/p.on_tmax_sd,
+         djf_tmax = (djf_tmax-djf_tmax_mean)/djf_tmax_sd,
+         ma_tmax = (ma_tmax-ma_tmax_mean)/ma_tmax_sd,
+         mj_tmax = (mj_tmax-mj_tmax_mean)/mj_tmax_sd,
+         ja_tmax = (ja_tmax-ja_tmax_mean)/ja_tmax_sd,
+         so_tmax = (so_tmax-so_tmax_mean)/so_tmax_sd,
+         nd_tmax = (nd_tmax-nd_tmax_mean)/nd_tmax_sd,
+         p.jj_ppt = (p.jj_ppt-p.jj_ppt_mean)/p.jj_ppt_sd,
+         p.as_ppt = (p.as_ppt-p.as_ppt_mean)/p.as_ppt_sd,
+         p.on_ppt = (p.on_ppt-p.on_ppt_mean)/p.on_ppt_sd,
+         djf_ppt = (djf_ppt-djf_ppt_mean)/djf_ppt_sd,
+         ma_ppt = (ma_ppt-ma_ppt_mean)/ma_ppt_sd,
+         mj_ppt = (mj_ppt-mj_ppt_mean)/mj_ppt_sd,
+         ja_ppt = (ja_ppt-ja_ppt_mean)/ja_ppt_sd,
+         so_ppt = (so_ppt-so_ppt_mean)/so_ppt_sd,
+         nd_ppt = (nd_ppt-nd_ppt_mean)/nd_ppt_sd,
+         s.r.bio01 = (r.bio01-bio01_mean)/bio01_sd,
+         s.r.bio12 = (r.bio12-bio12_mean)/bio12_sd) %>%
+  dplyr::select(-contains(c("_mean","_sd"))) %>% 
+  bind_cols(.,annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(bio01_mean = mean(bio01),
+                        bio12_mean = mean(bio12),
+                        bio01_sd = sd(bio01),
+                        bio12_sd = sd(bio12))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = mean((bio01.allnorm-bio01_mean)/bio01_sd),
+         bio12.allnorm = mean((bio12.allnorm-bio12_mean)/bio12_sd)) %>% 
+  dplyr::select(-contains(c("_mean","_sd","ppt_","tmax_","tmin","tmean"))) %>% 
+  left_join(., pre.dat %>%
+              group_by(Site,Tree) %>%
+              summarise(premean.BAI = mean(BAI),
+                        s.site.BA = mean(s.site.BA)),
+            by=c("Site","Tree"))
+
+
+species.fut2 <- fitted(b.3,
+                       newdata = future.dat %>% 
+                         dplyr::select(-contains(c("tmax","ppt"))) %>% 
+                         left_join(pre.dat %>% 
+                                     dplyr::select(Site,contains(c("tmax","ppt"))) %>% 
+                                     group_by(Site) %>% 
+                                     summarise(across(where(is.numeric),mean,na.rm=T)),
+                                   by="Site") %>% 
+                         mutate(bio01.allnorm = s.r.bio01,
+                                bio12.allnorm = s.r.bio12),
+                       re_formula = ~(1 + s.site.BA |Site) + (1|Site:Tree),
+                       scale = "response",
+                       resp = c("bio01.allnorm","bio12.allnorm","s.site.BA"), # play with this!
+) %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+pop.fut2 <- fitted(b.3,
+                   newdata = future.dat %>% 
+                     dplyr::select(-bio01.allnorm,-bio12.allnorm) %>% 
+                     left_join(pre.dat %>% 
+                                 dplyr::select(Site,bio01.allnorm,bio12.allnorm) %>% 
+                                 distinct(),
+                               by="Site"),
+                   re_formula = NULL,
+                   resp = c("p.jj_tmax","p.as_tmax","p.on_tmax","djf_tmax","ma_tmax","mj_tmax","ja_tmax","so_tmax","p.jj_ppt","p.as_ppt","p.on_ppt","djf_ppt","ma_ppt","mj_ppt","ja_ppt","so_ppt"),
+                   scale="response") %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+species.fut2 %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean,na.rm=T)) %>%
+  ggplot(.,aes(x=Year,group=Site))+
+  geom_line(aes(y=prop.Estimate),
+            col="darkblue", lwd=0.5,
+            alpha=0.25)+
+  geom_line(data = pop.fut2 %>%
+              group_by(Site,Year) %>%
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            aes(y=prop.Estimate),
+            col="darkred",lwd=0.5,
+            alpha=0.25)+
+  
+  #mean species
+  geom_ribbon(data = species.fut2 %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="dodgerblue3",
+              col=NA,
+              alpha=0.55) +
+  geom_line(data = species.fut2 %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkblue",lwd=1.25) +
+  
+  #mean population
+  geom_ribbon(data = pop.fut2 %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="red",
+              col=NA,
+              alpha=0.60) +
+  geom_line(data = pop.fut2 %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkred",lwd=1.25) +
+  geom_vline(xintercept = 2016,
+             lwd=2, col="gray") +
+  geom_violin(data = tree.summaries %>% 
+                filter(Year<1980) %>% 
+                group_by(Site,Tree) %>% 
+                mutate(rel.BAI = BAI/mean(BAI)) %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean)),         
+              inherit.aes=F,
+              aes(x = 2010,         #change this to fit the timescale of the data
+                  y = rel.BAI),
+              width=4,
+              fill="gray", lwd=0.5 ,
+              trim=T,
+              draw_quantiles = c(0.5,0.125,0.875)) +
+  geom_hline(yintercept=1,col="black",lwd=1,lty=2) +
+  labs( x = "Year",
+        y = "Relative growth",
+        title = "SSP2-4.5")
+
+```
+
+and **SSP1-2.6**:
+
+```{r}
+
+future.annual.summaries <- 
+  # climna.ssp585 %>% 
+  # climna.ssp370 %>% 
+  # climna.ssp245 %>% 
+  climna.ssp126 %>% 
+  filter(Site %in% annual.summaries$Site)
+
+future.dat <- future.annual.summaries %>% 
+  bind_rows(.,annual.summaries %>% 
+              dplyr::select(which(names(.)%in%names(future.annual.summaries)))) %>% 
+  arrange(Site,Year) %>% 
+  group_by(Site) %>% 
+  mutate(r.bio01 = zoo::rollmean(bio01,k=30,align="right",fill="extend"), 
+         r.bio12 = zoo::rollmean(bio12,k=30,align="right",fill="extend")) %>% 
+  filter(Year>2015) %>%
+  left_join(., post.dat %>% 
+              dplyr::select(Site,Tree) %>% 
+              distinct(),
+            by="Site") %>%
+  left_join(., annual.summaries %>% 
+              dplyr::select(Site,Year,contains(c("_tmax","_ppt","_tmean"))) %>% 
+              group_by(Site) %>% 
+              summarise(across(contains(c("_tmax","_ppt","_tmean")), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T)),
+            by="Site") %>% 
+  bind_cols(., annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(across(contains("bio"), 
+                               .fns = list(mean=mean,sd = sd),na.rm=T))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = bio01,
+         bio12.allnorm = bio12,
+         bio01 = (bio01-bio01_mean)/bio01_sd,
+         bio12 = (bio12-bio12_mean)/bio12_sd,
+         p.jj_tmax = (p.jj_tmax-p.jj_tmax_mean)/p.jj_tmax_sd,
+         p.as_tmax = (p.as_tmax-p.as_tmax_mean)/p.as_tmax_sd,
+         p.on_tmax = (p.on_tmax-p.on_tmax_mean)/p.on_tmax_sd,
+         djf_tmax = (djf_tmax-djf_tmax_mean)/djf_tmax_sd,
+         ma_tmax = (ma_tmax-ma_tmax_mean)/ma_tmax_sd,
+         mj_tmax = (mj_tmax-mj_tmax_mean)/mj_tmax_sd,
+         ja_tmax = (ja_tmax-ja_tmax_mean)/ja_tmax_sd,
+         so_tmax = (so_tmax-so_tmax_mean)/so_tmax_sd,
+         nd_tmax = (nd_tmax-nd_tmax_mean)/nd_tmax_sd,
+         p.jj_ppt = (p.jj_ppt-p.jj_ppt_mean)/p.jj_ppt_sd,
+         p.as_ppt = (p.as_ppt-p.as_ppt_mean)/p.as_ppt_sd,
+         p.on_ppt = (p.on_ppt-p.on_ppt_mean)/p.on_ppt_sd,
+         djf_ppt = (djf_ppt-djf_ppt_mean)/djf_ppt_sd,
+         ma_ppt = (ma_ppt-ma_ppt_mean)/ma_ppt_sd,
+         mj_ppt = (mj_ppt-mj_ppt_mean)/mj_ppt_sd,
+         ja_ppt = (ja_ppt-ja_ppt_mean)/ja_ppt_sd,
+         so_ppt = (so_ppt-so_ppt_mean)/so_ppt_sd,
+         nd_ppt = (nd_ppt-nd_ppt_mean)/nd_ppt_sd,
+         s.r.bio01 = (r.bio01-bio01_mean)/bio01_sd,
+         s.r.bio12 = (r.bio12-bio12_mean)/bio12_sd) %>%
+  dplyr::select(-contains(c("_mean","_sd"))) %>% 
+  bind_cols(.,annual.summaries %>% 
+              dplyr::select(Site,bio01,bio12) %>% 
+              summarise(bio01_mean = mean(bio01),
+                        bio12_mean = mean(bio12),
+                        bio01_sd = sd(bio01),
+                        bio12_sd = sd(bio12))) %>% 
+  group_by(Site) %>% 
+  mutate(bio01.allnorm = mean((bio01.allnorm-bio01_mean)/bio01_sd),
+         bio12.allnorm = mean((bio12.allnorm-bio12_mean)/bio12_sd)) %>% 
+  dplyr::select(-contains(c("_mean","_sd","ppt_","tmax_","tmin","tmean"))) %>% 
+  left_join(., pre.dat %>%
+              group_by(Site,Tree) %>%
+              summarise(premean.BAI = mean(BAI),
+                        s.site.BA = mean(s.site.BA)),
+            by=c("Site","Tree"))
+
+
+species.fut1 <- fitted(b.3,
+                       newdata = future.dat %>% 
+                         dplyr::select(-contains(c("tmax","ppt"))) %>% 
+                         left_join(pre.dat %>% 
+                                     dplyr::select(Site,contains(c("tmax","ppt"))) %>% 
+                                     group_by(Site) %>% 
+                                     summarise(across(where(is.numeric),mean,na.rm=T)),
+                                   by="Site") %>% 
+                         mutate(bio01.allnorm = s.r.bio01,
+                                bio12.allnorm = s.r.bio12),
+                       re_formula = ~(1 + s.site.BA |Site) + (1|Site:Tree),
+                       scale = "response",
+                       resp = c("bio01.allnorm","bio12.allnorm","s.site.BA"), # play with this!
+) %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+pop.fut1 <- fitted(b.3,
+                   newdata = future.dat %>% 
+                     dplyr::select(-bio01.allnorm,-bio12.allnorm) %>% 
+                     left_join(pre.dat %>% 
+                                 dplyr::select(Site,bio01.allnorm,bio12.allnorm) %>% 
+                                 distinct(),
+                               by="Site"),
+                   re_formula = NULL,
+                   resp = c("p.jj_tmax","p.as_tmax","p.on_tmax","djf_tmax","ma_tmax","mj_tmax","ja_tmax","so_tmax","p.jj_ppt","p.as_ppt","p.on_ppt","djf_ppt","ma_ppt","mj_ppt","ja_ppt","so_ppt"),
+                   scale="response") %>% 
+  as.data.frame() %>% 
+  bind_cols(future.dat) %>% 
+  mutate(prop.Estimate = Estimate/premean.BAI,
+         prop.Q2.5 = Q2.5/premean.BAI,
+         prop.Q97.5 = Q97.5/premean.BAI)
+
+
+species.fut1 %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean,na.rm=T)) %>%
+  ggplot(.,aes(x=Year,group=Site))+
+  geom_line(aes(y=prop.Estimate),
+            col="darkblue", lwd=0.5,
+            alpha=0.25)+
+  geom_line(data = pop.fut1 %>%
+              group_by(Site,Year) %>%
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            aes(y=prop.Estimate),
+            col="darkred",lwd=0.5,
+            alpha=0.25)+
+  
+  #mean species
+  geom_ribbon(data = species.fut1 %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="dodgerblue3",
+              col=NA,
+              alpha=0.55) +
+  geom_line(data = species.fut1 %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkblue",lwd=1.25) +
+  
+  #mean population
+  geom_ribbon(data = pop.fut1 %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean,na.rm=T)),
+              inherit.aes = F,
+              aes(x=Year,
+                  ymin=prop.Q2.5,
+                  ymax=prop.Q97.5),
+              fill="red",
+              col=NA,
+              alpha=0.60) +
+  geom_line(data = pop.fut1 %>% 
+              group_by(Year) %>% 
+              summarise(across(where(is.numeric),mean,na.rm=T)),
+            inherit.aes = F,
+            aes(x=Year,
+                y=prop.Estimate),
+            col="darkred",lwd=1.25) +
+  geom_vline(xintercept = 2016,
+             lwd=2, col="gray") +
+  geom_violin(data = tree.summaries %>% 
+                filter(Year<1980) %>% 
+                group_by(Site,Tree) %>% 
+                mutate(rel.BAI = BAI/mean(BAI)) %>% 
+                group_by(Year) %>% 
+                summarise(across(where(is.numeric),mean)),         
+              inherit.aes=F,
+              aes(x = 2010,         #change this to fit the timescale of the data
+                  y = rel.BAI),
+              width=4,
+              fill="gray", lwd=0.5 ,
+              trim=T,
+              draw_quantiles = c(0.5,0.125,0.875)) +
+  geom_hline(yintercept=1,col="black",lwd=1,lty=2) +
+  labs( x = "Year",
+        y = "Relative growth",
+        title = "SSP1-2.6")
+
+```
+
+To recreate main text Figure 2E, we simply plot the mean difference between species-wide and population-level predictions for each year in each site against the amount of forecasted warming. We can do that for each climate scenario, as below:
+
+```{r}
+
+pop.fut %>% 
+  dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+  rename(p.prop.Estimate=prop.Estimate,
+         p.Q2.5 = Q2.5,
+         p.Q97.5 = Q97.5) %>% 
+  left_join(annual.summaries %>% 
+              dplyr::select(Site,Year,bio01,bio12) %>% 
+              bind_rows(climna.ssp585 %>% 
+                          dplyr::select(Site,Year,bio01,bio12)) %>% 
+              group_by(Site) %>% 
+              mutate(bio01.filt = ifelse(Year<1951, bio01, NA),
+                     bio01.anom = bio01-mean(bio01.filt,na.rm=T),
+                     bio12.filt = ifelse(Year>1951, bio12, NA),
+                     bio12.anom = bio12-mean(bio12.filt, na.rm=T)) %>% 
+              filter(Year>2014),
+            by = c("Site","Year")) %>%
+  left_join(species.fut %>% 
+              dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+              rename(s.prop.Estimate=prop.Estimate,
+                     s.Q2.5 = Q2.5,
+                     s.Q97.5 = Q97.5),
+            by = c("Site","Year")) %>% 
+  mutate(prop.diff = s.prop.Estimate-p.prop.Estimate,
+         diff.low = s.Q2.5 - p.Q2.5,
+         diff.hi = s.Q97.5 - p.Q97.5) %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean)) %>% 
+  ggplot(.,
+         aes(x = bio01.anom,
+             y = prop.diff)) +
+  geom_point(pch = 19,
+             cex = 2,
+             alpha=0.1) +
+  geom_smooth(aes(group=Site),
+              se=F,
+              method="lm",
+              formula = y~poly(x,2),
+              col=rgb(0,0,0,0.6),
+              lwd=1) +
+  labs(x = "MAT anomaly",
+       y = "Prediction contrast",
+       title = "SSP5-8.5")
+
+```
+
+```{r}
+
+pop.fut %>% 
+  dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+  rename(p.prop.Estimate=prop.Estimate,
+         p.Q2.5 = Q2.5,
+         p.Q97.5 = Q97.5) %>% 
+  left_join(annual.summaries %>% 
+              dplyr::select(Site,Year,bio01,bio12) %>% 
+              bind_rows(climna.ssp245 %>% 
+                          dplyr::select(Site,Year,bio01,bio12)) %>%
+              group_by(Site) %>% 
+              mutate(bio01.filt = ifelse(Year<1951, bio01, NA),
+                     bio01.anom = bio01-mean(bio01.filt,na.rm=T),
+                     bio12.filt = ifelse(Year>1951, bio12, NA),
+                     bio12.anom = bio12-mean(bio12.filt, na.rm=T)) %>% 
+              filter(Year>2014),
+            by = c("Site","Year")) %>%
+  left_join(species.fut2 %>% 
+              dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+              rename(s.prop.Estimate=prop.Estimate,
+                     s.Q2.5 = Q2.5,
+                     s.Q97.5 = Q97.5),
+            by = c("Site","Year")) %>% 
+  mutate(prop.diff = s.prop.Estimate-p.prop.Estimate,
+         diff.low = s.Q2.5 - p.Q2.5,
+         diff.hi = s.Q97.5 - p.Q97.5) %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean)) %>% 
+  ggplot(.,
+         aes(x = bio01.anom,
+             y = prop.diff)) +
+  geom_point(pch = 19,
+             cex = 2,
+             alpha=0.1) +
+  geom_smooth(aes(group=Site),
+              se=F,
+              method="lm",
+              formula = y~poly(x,2),
+              col=rgb(0,0,0,0.6),
+              lwd=1) +
+  labs(x = "MAT anomaly",
+       y = "Prediction contrast",
+       title = "SSP2-4.5")
+
+```
+
+
+```{r}
+
+pop.fut %>% 
+  dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+  rename(p.prop.Estimate=prop.Estimate,
+         p.Q2.5 = Q2.5,
+         p.Q97.5 = Q97.5) %>% 
+  left_join(annual.summaries %>% 
+              dplyr::select(Site,Year,bio01,bio12) %>% 
+              bind_rows(climna.ssp126 %>% 
+                          dplyr::select(Site,Year,bio01,bio12)) %>%
+              group_by(Site) %>% 
+              mutate(bio01.filt = ifelse(Year<1951, bio01, NA),
+                     bio01.anom = bio01-mean(bio01.filt,na.rm=T),
+                     bio12.filt = ifelse(Year>1951, bio12, NA),
+                     bio12.anom = bio12-mean(bio12.filt, na.rm=T)) %>% 
+              filter(Year>2014),
+            by = c("Site","Year")) %>%
+  left_join(species.fut1 %>% 
+              dplyr::select(Site,Year,prop.Estimate,Q2.5,Q97.5) %>% 
+              rename(s.prop.Estimate=prop.Estimate,
+                     s.Q2.5 = Q2.5,
+                     s.Q97.5 = Q97.5),
+            by = c("Site","Year")) %>% 
+  mutate(prop.diff = s.prop.Estimate-p.prop.Estimate,
+         diff.low = s.Q2.5 - p.Q2.5,
+         diff.hi = s.Q97.5 - p.Q97.5) %>% 
+  group_by(Site,Year) %>% 
+  summarise(across(where(is.numeric),mean)) %>% 
+  ggplot(.,
+         aes(x = bio01.anom,
+             y = prop.diff)) +
+  geom_point(pch = 19,
+             cex = 2,
+             alpha=0.1) +
+  geom_smooth(aes(group=Site),
+              se=F,
+              method="lm",
+              formula = y~poly(x,2),
+              col=rgb(0,0,0,0.6),
+              lwd=1) +
+  labs(x = "MAT anomaly",
+       y = "Prediction contrast",
+       title = "SSP1-2.6")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
